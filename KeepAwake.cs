@@ -6,6 +6,22 @@ using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
+// General assembly info.
+[assembly: AssemblyTitle("Keep Awake")]
+[assembly: AssemblyDescription("Tray utility that prevents the system from entering Modern Standby / sleep.")]
+[assembly: AssemblyConfiguration("Release")]
+[assembly: AssemblyCompany("github.com/relik7")]
+[assembly: AssemblyProduct("Keep Awake")]
+[assembly: AssemblyCopyright("Copyright © 2026")]
+[assembly: AssemblyTrademark("")]
+[assembly: AssemblyCulture("")]
+ 
+[assembly: ComVisible(false)]
+[assembly: Guid("0e910fec-87a2-4f90-8e31-5c3d2133df8e")]
+
+[assembly: AssemblyVersion("1.0.1.0")]
+[assembly: AssemblyFileVersion("1.0.1.0")]
+
 namespace KeepAwake
 {
 	static class Program
