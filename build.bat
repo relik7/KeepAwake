@@ -1,11 +1,11 @@
 @echo off
 setlocal
-set CSC=C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe
+set CSC=%WINDIR%\Microsoft.NET\Framework\v4.0.30319\csc.exe
 
 if not exist "%CSC%" (
     echo Could not find csc.exe at %CSC%
     echo If you are on 64-bit Windows and only have the Framework64 compiler,
-    echo try: C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe
+    echo try: %WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
     pause
     exit /b 1
 )
