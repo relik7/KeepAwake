@@ -6,6 +6,19 @@ using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
+// NOTES ON VIRUSTOTAL / MITRE BEHAVIORAL FLAGS
+// ---------------------------------------------------
+// A dynamic-analysis sandbox (the "Process Injection" T1055 findings in particular)
+// flags this binary for things like "altered memory protections from unbacked memory",
+// "resolved API addresses from unbacked memory", and "registered a vectored exception
+// handler". None of these come from a line of code below - they describe how the
+// .NET/CLR runtime itself works: the JIT compiler writes native code into memory pages
+// it allocates at runtime (not backed by a file on disk), P/Invoke calls get marshaling
+// stubs generated the same way, and the CLR globally registers a VEH for its own
+// structured-exception-handling. Every managed .NET/C# executable exhibits this,
+// including an empty "Hello World" console app - it is not something this file can
+// opt out of short of not being a .NET application.
+//
 // General assembly info.
 [assembly: AssemblyTitle("Keep Awake")]
 [assembly: AssemblyDescription("Tray utility that prevents the system from entering Modern Standby / sleep.")]
@@ -61,6 +74,12 @@ namespace KeepAwake
 			trayIcon.MouseUp += TrayIcon_MouseUp;
 			trayIcon.Visible = true;
 
+			// Hooking shutdown/logoff events is what likely trips the "Hijack Execution
+			// Flow" (T1574) finding: malware often hooks process-exit/session-ending to
+			// wipe traces before termination, so sandboxes flag the pattern generically.
+			// Here it exists only so DisablePreventSuspend()/CloseHandle() run on the way
+			// out (see Cleanup() below) - without it, the power request and the AC power
+			// timeout override could be left applied after the app closes.
 			SystemEvents.SessionEnding += SystemEvents_SessionEnding;
 			AppDomain.CurrentDomain.ProcessExit += CurrentDomain_ProcessExit;
 
@@ -70,6 +89,13 @@ namespace KeepAwake
 			EnablePreventSuspend();
 		}
 
+		// Loads the two tray icons that ship embedded inside this assembly as resources.
+		// Using Assembly.GetManifestResourceStream to pull an embedded blob out at runtime
+		// is the standard, long-established WinForms pattern for icons that are compiled
+		// into the exe - but it is also the shape sandboxes watch for as a "fileless
+		// loader" (malware pulling a payload out of its own resources at runtime), so it
+		// can contribute to generic "obfuscated/packed" style flags. Left as-is: it only
+		// loads two .ico images and does not change what gets executed.
 		private void LoadIcons()
 		{
 			Assembly asm = Assembly.GetExecutingAssembly();
@@ -144,6 +170,15 @@ namespace KeepAwake
 
 		#region Power management
 
+		// Reads the active power scheme and checks whether the Modern Standby /
+		// "execution required" idle-resiliency setting exists on this machine, then bails
+		// out gracefully with a message box if it doesn't (older systems / some VMs don't
+		// expose it). Querying system power capabilities before deciding how to proceed is
+		// exactly the shape of "System Information Discovery" (T1082) / "Virtualization-
+		// Sandbox Evasion" (T1497) heuristics - malware that checks its environment before
+		// acting looks identical at the API level to legitimate feature-detection. This
+		// check is required: without it the calls below would silently no-op or throw on
+		// systems that don't support Modern Standby.
 		private void InitializePower()
 		{
 			IntPtr pActiveSchemeGuid;
@@ -169,6 +204,16 @@ namespace KeepAwake
 				ThrowLastWin32Error();
 		}
 
+		// This pair of methods (EnablePreventSuspend/DisablePreventSuspend below) is the
+		// entire point of the app: they write the "execution required" idle-resiliency
+		// timeout to -1 (never suspend) and register a PowerRequestExecutionRequired
+		// request, then reassert the active scheme so Windows picks the change up
+		// immediately. Rewriting system power policy and forcing it to reapply is also
+		// exactly what T1562 "Impair Defenses" heuristics watch for, because malware
+		// (e.g. cryptominers, C2 beacons) uses the identical API sequence to stop a
+		// machine from sleeping so it keeps running unattended. There is no way to
+		// distinguish the two at the API level - this is a legitimate, user-invoked use
+		// of the same mechanism, and removing it would defeat the purpose of the app.
 		private void EnablePreventSuspend()
 		{
 			uint hr = PowerWriteDCValueIndex(IntPtr.Zero, activeSchemeGuid, GUID_IDLE_RESILIENCY_SUBGROUP, GUID_EXECUTION_REQUIRED_REQUEST_TIMEOUT, -1);
@@ -226,6 +271,13 @@ namespace KeepAwake
 		#endregion
 
 		#region Win32 / Power API interop
+		// Every DllImport below needs a native function pointer resolved and a marshaling
+		// stub JIT-compiled the first time it's called (that's how P/Invoke works). That
+		// stub-generation step is almost certainly what the "manually resolves API
+		// addresses from dynamically allocated (unbacked) memory" Process Injection
+		// finding is picking up on - it happens for every P/Invoke call in every .NET
+		// app, not something specific to these particular Win32 APIs. These calls are
+		// required to talk to PowrProf.dll/kernel32.dll; there's no managed equivalent.
 
 		static void ThrowLastWin32Error()
 		{
