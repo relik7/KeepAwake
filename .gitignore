@@ -1,7 +1,7 @@
 # Ignore AI
 RULES.md
 AGENTS.md
-.freebuf/
+.freebuff/
 # Ignore temp builds
 *.exe
 
