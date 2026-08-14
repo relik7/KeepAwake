@@ -6,19 +6,6 @@ using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-// NOTES ON VIRUSTOTAL / MITRE BEHAVIORAL FLAGS
-// ---------------------------------------------------
-// A dynamic-analysis sandbox (the "Process Injection" T1055 findings in particular)
-// flags this binary for things like "altered memory protections from unbacked memory",
-// "resolved API addresses from unbacked memory", and "registered a vectored exception
-// handler". None of these come from a line of code below - they describe how the
-// .NET/CLR runtime itself works: the JIT compiler writes native code into memory pages
-// it allocates at runtime (not backed by a file on disk), P/Invoke calls get marshaling
-// stubs generated the same way, and the CLR globally registers a VEH for its own
-// structured-exception-handling. Every managed .NET/C# executable exhibits this,
-// including an empty "Hello World" console app - it is not something this file can
-// opt out of short of not being a .NET application.
-//
 // General assembly info.
 [assembly: AssemblyTitle("Keep Awake")]
 [assembly: AssemblyDescription("Tray utility that prevents the system from entering Modern Standby / sleep.")]
@@ -44,13 +31,23 @@ namespace KeepAwake
 		{
 			Application.EnableVisualStyles();
 			Application.SetCompatibleTextRenderingDefault(false);
-			Application.Run(new TrayApplicationContext());
+
+			try
+			{
+				Application.Run(new TrayApplicationContext());
+			}
+			catch (Exception ex)
+			{
+				Environment.ExitCode = 1;
+				MessageBox.Show("Keep Awake failed to start: " + ex.Message, "Keep Awake", MessageBoxButtons.OK, MessageBoxIcon.Error);
+			}
 		}
 	}
 
 	public class TrayApplicationContext : ApplicationContext
 	{
 		private NotifyIcon trayIcon;
+		private ContextMenuStrip menu;
 		private Icon iconOn;
 		private Icon iconOff;
 		private bool preventSuspendEnabled;
@@ -62,40 +59,38 @@ namespace KeepAwake
 
 		public TrayApplicationContext()
 		{
-			LoadIcons();
+			try
+			{
+				LoadIcons();
 
-			ContextMenuStrip menu = new ContextMenuStrip();
-			menu.Items.Add("Exit", null, OnExit);
+				menu = new ContextMenuStrip();
+				menu.Items.Add("Exit", null, OnExit);
 
-			trayIcon = new NotifyIcon();
-			trayIcon.Icon = iconOff;
-			trayIcon.Text = "Keep Awake";
-			trayIcon.ContextMenuStrip = menu;
-			trayIcon.MouseUp += TrayIcon_MouseUp;
-			trayIcon.Visible = true;
+				trayIcon = new NotifyIcon();
+				trayIcon.Icon = iconOff;
+				trayIcon.Text = "Keep Awake";
+				trayIcon.ContextMenuStrip = menu;
+				trayIcon.MouseUp += TrayIcon_MouseUp;
+				trayIcon.Visible = true;
 
-			// Hooking shutdown/logoff events is what likely trips the "Hijack Execution
-			// Flow" (T1574) finding: malware often hooks process-exit/session-ending to
-			// wipe traces before termination, so sandboxes flag the pattern generically.
-			// Here it exists only so DisablePreventSuspend()/CloseHandle() run on the way
-			// out (see Cleanup() below) - without it, the power request and the AC power
-			// timeout override could be left applied after the app closes.
-			SystemEvents.SessionEnding += SystemEvents_SessionEnding;
-			AppDomain.CurrentDomain.ProcessExit += CurrentDomain_ProcessExit;
+				SystemEvents.SessionEnding += SystemEvents_SessionEnding;
+				AppDomain.CurrentDomain.ProcessExit += CurrentDomain_ProcessExit;
 
-			InitializePower();
+				InitializePower();
 
-			// Default to preventing suspend on startup
-			EnablePreventSuspend();
+				// Default to preventing suspend on startup
+				EnablePreventSuspend();
+			}
+			catch
+			{
+				// Release the power request handle and UI resources if startup fails
+				// partway through; Main() reports the error to the user.
+				Cleanup();
+				throw;
+			}
 		}
 
 		// Loads the two tray icons that ship embedded inside this assembly as resources.
-		// Using Assembly.GetManifestResourceStream to pull an embedded blob out at runtime
-		// is the standard, long-established WinForms pattern for icons that are compiled
-		// into the exe - but it is also the shape sandboxes watch for as a "fileless
-		// loader" (malware pulling a payload out of its own resources at runtime), so it
-		// can contribute to generic "obfuscated/packed" style flags. Left as-is: it only
-		// loads two .ico images and does not change what gets executed.
 		private void LoadIcons()
 		{
 			Assembly asm = Assembly.GetExecutingAssembly();
@@ -119,29 +114,32 @@ namespace KeepAwake
 
 		private void Toggle()
 		{
-			if (preventSuspendEnabled)
-				DisablePreventSuspend();
-			else
-				EnablePreventSuspend();
+			try
+			{
+				if (preventSuspendEnabled)
+					DisablePreventSuspend();
+				else
+					EnablePreventSuspend();
+			}
+			catch (Exception ex)
+			{
+				MessageBox.Show("Keep Awake could not change the sleep state: " + ex.Message, "Keep Awake", MessageBoxButtons.OK, MessageBoxIcon.Error);
+			}
 		}
 
 		private void OnExit(object sender, EventArgs e)
 		{
-			trayIcon.Visible = false;
 			Cleanup();
 			ExitThread();
 		}
 
 		private void SystemEvents_SessionEnding(object sender, SessionEndingEventArgs e)
 		{
-			trayIcon.Visible = false;
 			Cleanup();
 		}
 
 		private void CurrentDomain_ProcessExit(object sender, EventArgs e)
 		{
-			if (trayIcon != null)
-				trayIcon.Visible = false;
 			Cleanup();
 		}
 
@@ -151,21 +149,76 @@ namespace KeepAwake
 				return;
 			cleanedUp = true;
 
+			// Restore the saved power timeout first (best-effort).
 			try
 			{
 				if (preventSuspendEnabled)
 					DisablePreventSuspend();
-
-				if (powerRequestHandle != IntPtr.Zero)
-				{
-					CloseHandle(powerRequestHandle);
-					powerRequestHandle = IntPtr.Zero;
-				}
 			}
 			catch
 			{
 				// best-effort cleanup on shutdown/exit
 			}
+
+			// Always close the request handle, even if the restore above threw.
+			if (powerRequestHandle != IntPtr.Zero)
+			{
+				CloseHandle(powerRequestHandle);
+				powerRequestHandle = IntPtr.Zero;
+			}
+
+			DisposeResources();
+		}
+
+		private void DisposeResources()
+		{
+			try
+			{
+				SystemEvents.SessionEnding -= SystemEvents_SessionEnding;
+			}
+			catch
+			{
+				// best-effort
+			}
+
+			try
+			{
+				if (trayIcon != null)
+				{
+					trayIcon.Visible = false;
+					trayIcon.Dispose();
+					trayIcon = null;
+				}
+
+				if (menu != null)
+				{
+					menu.Dispose();
+					menu = null;
+				}
+
+				if (iconOn != null)
+				{
+					iconOn.Dispose();
+					iconOn = null;
+				}
+
+				if (iconOff != null)
+				{
+					iconOff.Dispose();
+					iconOff = null;
+				}
+			}
+			catch
+			{
+				// best-effort resource cleanup
+			}
+		}
+
+		private void FatalError(string message)
+		{
+			Cleanup();
+			MessageBox.Show(message, "Keep Awake", MessageBoxButtons.OK, MessageBoxIcon.Error);
+			Environment.Exit(1);
 		}
 
 		#region Power management
@@ -173,12 +226,7 @@ namespace KeepAwake
 		// Reads the active power scheme and checks whether the Modern Standby /
 		// "execution required" idle-resiliency setting exists on this machine, then bails
 		// out gracefully with a message box if it doesn't (older systems / some VMs don't
-		// expose it). Querying system power capabilities before deciding how to proceed is
-		// exactly the shape of "System Information Discovery" (T1082) / "Virtualization-
-		// Sandbox Evasion" (T1497) heuristics - malware that checks its environment before
-		// acting looks identical at the API level to legitimate feature-detection. This
-		// check is required: without it the calls below would silently no-op or throw on
-		// systems that don't support Modern Standby.
+		// expose it).
 		private void InitializePower()
 		{
 			IntPtr pActiveSchemeGuid;
@@ -191,8 +239,7 @@ namespace KeepAwake
 			uint readHr = PowerReadDCValueIndex(IntPtr.Zero, activeSchemeGuid, GUID_IDLE_RESILIENCY_SUBGROUP, GUID_EXECUTION_REQUIRED_REQUEST_TIMEOUT, out savedTimeout);
 			if (readHr != 0)
 			{
-				MessageBox.Show("Connected Standby / Modern Standby does not appear to be supported on this system. Keep Awake cannot continue.", "Keep Awake", MessageBoxButtons.OK, MessageBoxIcon.Error);
-				Environment.Exit(1);
+				FatalError("Connected Standby / Modern Standby does not appear to be supported on this system. Keep Awake cannot continue.");
 			}
 
 			POWER_REQUEST_CONTEXT context = new POWER_REQUEST_CONTEXT();
@@ -208,47 +255,95 @@ namespace KeepAwake
 		// entire point of the app: they write the "execution required" idle-resiliency
 		// timeout to -1 (never suspend) and register a PowerRequestExecutionRequired
 		// request, then reassert the active scheme so Windows picks the change up
-		// immediately. Rewriting system power policy and forcing it to reapply is also
-		// exactly what T1562 "Impair Defenses" heuristics watch for, because malware
-		// (e.g. cryptominers, C2 beacons) uses the identical API sequence to stop a
-		// machine from sleeping so it keeps running unattended. There is no way to
-		// distinguish the two at the API level - this is a legitimate, user-invoked use
-		// of the same mechanism, and removing it would defeat the purpose of the app.
+		// immediately.
 		private void EnablePreventSuspend()
 		{
-			uint hr = PowerWriteDCValueIndex(IntPtr.Zero, activeSchemeGuid, GUID_IDLE_RESILIENCY_SUBGROUP, GUID_EXECUTION_REQUIRED_REQUEST_TIMEOUT, -1);
-			if (hr != 0)
-				Marshal.ThrowExceptionForHR((int)hr);
+			bool timeoutWritten = false;
+			try
+			{
+				uint hr = PowerWriteDCValueIndex(IntPtr.Zero, activeSchemeGuid, GUID_IDLE_RESILIENCY_SUBGROUP, GUID_EXECUTION_REQUIRED_REQUEST_TIMEOUT, NEVER_SUSPEND);
+				if (hr != 0)
+					Marshal.ThrowExceptionForHR((int)hr);
+				timeoutWritten = true;
 
-			if (!PowerSetRequest(powerRequestHandle, PowerRequestType.PowerRequestExecutionRequired))
-				ThrowLastWin32Error();
+				if (!PowerSetRequest(powerRequestHandle, PowerRequestType.PowerRequestExecutionRequired))
+					ThrowLastWin32Error();
 
-			ReapplyActiveScheme();
+				// Mark as enabled before re-applying so that Cleanup() restores the
+				// saved timeout if ReapplyActiveScheme() fails fatally below.
+				preventSuspendEnabled = true;
 
-			preventSuspendEnabled = true;
+				ReapplyActiveScheme();
+			}
+			catch
+			{
+				// A partial failure must not leave the "never suspend" timeout in
+				// place: restore the saved value before propagating the error.
+				if (timeoutWritten)
+				{
+					preventSuspendEnabled = false;
+					try
+					{
+						PowerWriteDCValueIndex(IntPtr.Zero, activeSchemeGuid, GUID_IDLE_RESILIENCY_SUBGROUP, GUID_EXECUTION_REQUIRED_REQUEST_TIMEOUT, savedTimeout);
+						TryReapplyActiveScheme();
+					}
+					catch
+					{
+						// best-effort rollback; the original error is still reported
+					}
+				}
+				throw;
+			}
+
 			UpdateTrayState();
 		}
 
 		private void DisablePreventSuspend()
 		{
-			PowerClearRequest(powerRequestHandle, PowerRequestType.PowerRequestExecutionRequired);
+			if (!PowerClearRequest(powerRequestHandle, PowerRequestType.PowerRequestExecutionRequired))
+				ThrowLastWin32Error();
 
-			uint hr = PowerWriteDCValueIndex(IntPtr.Zero, activeSchemeGuid, GUID_IDLE_RESILIENCY_SUBGROUP, GUID_EXECUTION_REQUIRED_REQUEST_TIMEOUT, savedTimeout);
-			if (hr != 0)
-				Marshal.ThrowExceptionForHR((int)hr);
-
-			ReapplyActiveScheme();
-
+			// The request is what actually keeps the system awake, so reflect that it
+			// is now off before attempting the timeout restore, which can still fail
+			// and otherwise leave the tray icon reporting "on".
 			preventSuspendEnabled = false;
-			UpdateTrayState();
+
+			try
+			{
+				uint hr = PowerWriteDCValueIndex(IntPtr.Zero, activeSchemeGuid, GUID_IDLE_RESILIENCY_SUBGROUP, GUID_EXECUTION_REQUIRED_REQUEST_TIMEOUT, savedTimeout);
+				if (hr != 0)
+					Marshal.ThrowExceptionForHR((int)hr);
+
+				TryReapplyActiveScheme();
+			}
+			finally
+			{
+				// Keep the tray icon in sync with the new state even if the
+				// timeout restore threw.
+				UpdateTrayState();
+			}
 		}
 
 		private void ReapplyActiveScheme()
 		{
+			if (TryReapplyActiveScheme())
+				return;
+
+			// If the active scheme can't be read, the system's sleep settings may be
+			// left modified and we can't be sure of the state - tell the user, clean
+			// up, and exit.
+			FatalError("Keep Awake could not re-apply the active power scheme. Keep Awake will now exit.");
+		}
+
+		private bool TryReapplyActiveScheme()
+		{
 			IntPtr curScheme;
-			PowerGetActiveScheme(IntPtr.Zero, out curScheme);
+			if (PowerGetActiveScheme(IntPtr.Zero, out curScheme) != 0)
+				return false;
+
 			PowerSetActiveScheme(IntPtr.Zero, curScheme);
 			LocalFree(curScheme);
+			return true;
 		}
 
 		private void UpdateTrayState()
@@ -271,13 +366,6 @@ namespace KeepAwake
 		#endregion
 
 		#region Win32 / Power API interop
-		// Every DllImport below needs a native function pointer resolved and a marshaling
-		// stub JIT-compiled the first time it's called (that's how P/Invoke works). That
-		// stub-generation step is almost certainly what the "manually resolves API
-		// addresses from dynamically allocated (unbacked) memory" Process Injection
-		// finding is picking up on - it happens for every P/Invoke call in every .NET
-		// app, not something specific to these particular Win32 APIs. These calls are
-		// required to talk to PowrProf.dll/kernel32.dll; there's no managed equivalent.
 
 		static void ThrowLastWin32Error()
 		{
@@ -304,6 +392,7 @@ namespace KeepAwake
 
 		const int POWER_REQUEST_CONTEXT_VERSION = 0;
 		const int POWER_REQUEST_CONTEXT_SIMPLE_STRING = 0x1;
+		const int NEVER_SUSPEND = -1; // "execution required" requests never time out
 
 		static readonly Guid GUID_IDLE_RESILIENCY_SUBGROUP = new Guid(0x2e601130, 0x5351, 0x4d9d, 0x8e, 0x4, 0x25, 0x29, 0x66, 0xba, 0xd0, 0x54);
 		static readonly Guid GUID_EXECUTION_REQUIRED_REQUEST_TIMEOUT = new Guid(0x3166bc41, 0x7e98, 0x4e03, 0xb3, 0x4e, 0xec, 0xf, 0x5f, 0x2b, 0x21, 0x8e);
